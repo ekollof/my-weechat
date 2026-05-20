@@ -23,6 +23,10 @@ done
 sed -i 's/\(slack_api_token\s*=\s*\)"xox[^"]*"/\1"YOUR_SLACK_TOKEN_HERE"/' \
     "$SCRIPT_DIR/weechat-conf/plugins.conf"
 
+# scrub xmpp account names and irc server references from weechat.conf
+sed -i -E '/^xmpp\.(account|andrath)\./d' "$SCRIPT_DIR/weechat-conf/weechat.conf"
+sed -i '/^irc\.server\./d' "$SCRIPT_DIR/weechat-conf/weechat.conf"
+
 # python scripts
 cp "$WEECHAT_DATA/python/autosort.py" \
    "$WEECHAT_DATA/python/cmd_help.py" \
