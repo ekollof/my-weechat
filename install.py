@@ -287,7 +287,7 @@ def main():
             info("xmpp.so already present — skipped (rebuild locally if needed)")
     else:
         warn("xmpp.so not found in export — skipping")
-        warn("Build from: https://github.com/ekollof/weechat-xmpp-improved")
+        warn("Build from: https://github.com/ekollof/xepher")
 
     # -------------------------------------------------------------------------
     # Done
@@ -309,8 +309,8 @@ Debug socket (optional):
   weechat-cmd '/set weechat.color.chat_bg default'
 
 Rebuild xmpp.so for a different architecture:
-  git clone --depth 1 https://github.com/ekollof/weechat-xmpp-improved.git
-  cd weechat-xmpp-improved && sudo make install-deps && make && make install
+  git clone --depth 1 https://github.com/ekollof/xepher.git
+  cd xepher && sudo make install-deps && make && make install
 """)
 
 
