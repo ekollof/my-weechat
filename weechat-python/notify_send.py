@@ -699,6 +699,8 @@ def escape_slashes(message):
 
 def send_notification(notification):
     """Sends the given notification to the user."""
+    if os.environ.get('SSH_TTY') and not os.environ.get('DISPLAY'):
+        return
     notify_cmd = ['notify-send', '--app-name', 'weechat']
     if notification.icon:
         notify_cmd += ['--icon', notification.icon]
@@ -735,8 +737,9 @@ def send_notification(notification):
                 notify_cmd,
                 stderr=subprocess.STDOUT,
                 stdout=devnull,
+                timeout=3,
             )
-        except Exception as ex:
+        except (subprocess.TimeoutExpired, Exception) as ex:
             error_message = '{} (reason: {!r}). {}'.format(
                 'Failed to send the notification via notify-send',
                 '{}: {}'.format(ex.__class__.__name__, ex),
