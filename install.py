@@ -26,12 +26,26 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-WEECHAT_CONF = (
-    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "weechat"
-)
-WEECHAT_DATA = (
-    Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "weechat"
-)
+XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+LEGACY_HOME = Path.home() / ".weechat"
+
+# WeeChat uses XDG dirs only when WEECHAT_HOME is unset and ~/.weechat does not
+# exist; otherwise it uses the legacy home. Match that logic so we install to
+# the directory WeeChat will actually load.
+if os.environ.get("WEECHAT_HOME"):
+    WEECHAT_HOME = Path(os.environ["WEECHAT_HOME"])
+    WEECHAT_CONF = WEECHAT_HOME
+    WEECHAT_DATA = WEECHAT_HOME
+elif LEGACY_HOME.exists():
+    WEECHAT_HOME = LEGACY_HOME
+    WEECHAT_CONF = LEGACY_HOME
+    WEECHAT_DATA = LEGACY_HOME
+else:
+    WEECHAT_HOME = None
+    WEECHAT_CONF = XDG_CONFIG_HOME / "weechat"
+    WEECHAT_DATA = XDG_DATA_HOME / "weechat"
+
 SRC_CONF = SCRIPT_DIR / "weechat-conf"
 SRC_PYTHON = SCRIPT_DIR / "weechat-python"
 SRC_SO = SCRIPT_DIR / "weechat-plugins" / "xmpp.so"
@@ -175,6 +189,11 @@ def main():
         error(f"Source conf dir not found: {SRC_CONF}")
     if not SRC_PYTHON.is_dir():
         error(f"Source python dir not found: {SRC_PYTHON}")
+
+    if WEECHAT_HOME == LEGACY_HOME:
+        warn(f"Using legacy WeeChat home: {LEGACY_HOME}")
+        warn("To switch to XDG directories, move ~/.weechat to ~/.config/weechat")
+        warn("and ~/.local/share/weechat, then remove ~/.weechat.")
 
     WEECHAT_CONF.mkdir(parents=True, exist_ok=True)
     (WEECHAT_DATA / "python" / "autoload").mkdir(parents=True, exist_ok=True)

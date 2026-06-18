@@ -24,8 +24,11 @@ SCRIPT_LICENSE = "WTFPL"
 SCRIPT_DESC = "Live wallust/pywal palette colors — watches colors.json for changes"
 
 COLORS_JSON = os.path.expanduser("~/.cache/wal/colors.json")
-BUFLIST_CONF = os.path.expanduser("~/.config/weechat/buflist.conf")
-PLUGINS_CONF = os.path.expanduser("~/.config/weechat/plugins.conf")
+WEECHAT_CONFIG_DIR = weechat.info_get("weechat_config_dir", "") or os.path.expanduser(
+    "~/.config/weechat"
+)
+BUFLIST_CONF = os.path.join(WEECHAT_CONFIG_DIR, "buflist.conf")
+PLUGINS_CONF = os.path.join(WEECHAT_CONFIG_DIR, "plugins.conf")
 POLL_MS = 1000  # mtime check interval in milliseconds
 
 _last_mtime = 0.0

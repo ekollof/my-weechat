@@ -6,9 +6,30 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WEECHAT_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/weechat"
-WEECHAT_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/weechat"
-WALLUST_SCRIPTS="${XDG_CONFIG_HOME:-$HOME/.config}/wallust/scripts"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+LEGACY_HOME="$HOME/.weechat"
+
+# WeeChat uses XDG dirs only when WEECHAT_HOME is unset and ~/.weechat does not
+# exist; otherwise it uses the legacy home. Match that logic.
+if [[ -n "${WEECHAT_HOME:-}" ]]; then
+    WEECHAT_HOME="$WEECHAT_HOME"
+    WEECHAT_CONF="$WEECHAT_HOME"
+    WEECHAT_DATA="$WEECHAT_HOME"
+elif [[ -d "$LEGACY_HOME" ]]; then
+    WEECHAT_HOME="$LEGACY_HOME"
+    WEECHAT_CONF="$LEGACY_HOME"
+    WEECHAT_DATA="$LEGACY_HOME"
+else
+    WEECHAT_CONF="$XDG_CONFIG_HOME/weechat"
+    WEECHAT_DATA="$XDG_DATA_HOME/weechat"
+fi
+
+WALLUST_SCRIPTS="${XDG_CONFIG_HOME}/wallust/scripts"
+
+if [[ -n "${WEECHAT_HOME:-}" && "$WEECHAT_HOME" == "$LEGACY_HOME" ]]; then
+    echo "!! Using legacy WeeChat home: $LEGACY_HOME" >&2
+fi
 
 # conf files: skip secrets and machine-specific files
 for f in "$WEECHAT_CONF"/*.conf; do
