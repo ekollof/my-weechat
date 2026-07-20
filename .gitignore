@@ -1,2 +1,9 @@
 __pycache__/
 *.py[cod]
+
+# Never commit machine-specific or secret-bearing WeeChat config
+weechat-conf/sec.conf
+weechat-conf/irc.conf
+weechat-conf/xmpp.conf
+weechat-conf/relay.conf
+weechat-conf/*.bak

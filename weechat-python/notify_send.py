@@ -50,7 +50,7 @@ SCRIPT_NAME = 'notify_send'
 SCRIPT_AUTHOR = 's3rvac'
 
 # Version of the script.
-SCRIPT_VERSION = '0.11 (dev)'
+SCRIPT_VERSION = '0.11.1-ekollof'
 
 # License under which the script is distributed.
 SCRIPT_LICENSE = 'MIT'
@@ -246,34 +246,62 @@ def parse_tags(tags):
     return tags.split(',')
 
 
+def notification_nick(buffer, tags, prefix, is_highlight):
+    """Returns the nick to use in a notification, with a buffer-name fallback."""
+    nick = nick_that_sent_message(tags, prefix)
+    if nick:
+        return nick
+
+    if is_mention_or_privmsg(buffer, tags, is_highlight):
+        return (weechat.buffer_get_string(buffer, 'short_name') or
+                weechat.buffer_get_string(buffer, 'name') or
+                '?')
+
+    return ''
+
+
 def message_printed_callback(data, buffer, date, tags, is_displayed,
                              is_highlight, prefix, message):
     """A callback when a message is printed."""
     is_displayed = int(is_displayed)
     is_highlight = int(is_highlight)
     tags = parse_tags(tags)
-    nick = nick_that_sent_message(tags, prefix)
+    nick = notification_nick(buffer, tags, prefix, is_highlight)
 
     if notification_should_be_sent(buffer, tags, nick, is_displayed, is_highlight, message):
-        notification = prepare_notification(buffer, nick, message)
+        notification = prepare_notification(buffer, nick, message, is_highlight)
         send_notification(notification)
 
     return weechat.WEECHAT_RC_OK
 
 
+def is_mention_or_privmsg(buffer, tags, is_highlight):
+    """Is this a highlight/mention or a private message?"""
+    if is_highlight:
+        return True
+
+    if is_private_message(buffer):
+        return True
+
+    important_tags = {'notify_highlight', 'notify_private'}
+    return bool(important_tags.intersection(tags))
+
+
 def notification_should_be_sent(buffer, tags, nick, is_displayed, is_highlight, message):
     """Should a notification be sent?"""
-    if notification_should_be_sent_disregarding_time(buffer, tags, nick,
-                                                     is_displayed, is_highlight, message):
+    important = is_mention_or_privmsg(buffer, tags, is_highlight)
+    if notification_should_be_sent_disregarding_time(
+            buffer, tags, nick, is_displayed, is_highlight, message, important):
         # The following function should be called only when the notification
         # should be sent (it updates the last notification time).
-        if not is_below_min_notification_delay(buffer):
+        if important or not is_below_min_notification_delay(buffer):
             return True
     return False
 
 
 def notification_should_be_sent_disregarding_time(buffer, tags, nick,
-                                                  is_displayed, is_highlight, message):
+                                                  is_displayed, is_highlight, message,
+                                                  important):
     """Should a notification be sent when not considering time?"""
     if not nick:
         # A nick is required to form a correct notification source/message.
@@ -283,14 +311,14 @@ def notification_should_be_sent_disregarding_time(buffer, tags, nick,
         return False
 
     if not is_displayed:
-        if not notify_on_filtered_messages():
+        if not important and not notify_on_filtered_messages():
             return False
 
     if is_away(buffer):
         if not notify_when_away():
             return False
 
-    if ignore_notifications_from_messages_tagged_with(tags):
+    if ignore_notifications_from_messages_tagged_with(tags, important):
         return False
 
     if ignore_notifications_from_nick(nick):
@@ -305,10 +333,10 @@ def notification_should_be_sent_disregarding_time(buffer, tags, nick,
         elif notify_on_all_messages_in_current_buffer():
             return True
 
-    if is_private_message(buffer):
+    if is_private_message(buffer) or 'notify_private' in tags:
         return notify_on_private_messages()
 
-    if is_highlight:
+    if is_highlight or 'notify_highlight' in tags:
         return notify_on_highlights()
 
     if notify_on_messages_that_match(message):
@@ -458,12 +486,14 @@ def split_option_value(option, separator=','):
     return [value.strip() for value in values.split(separator)]
 
 
-def ignore_notifications_from_messages_tagged_with(tags):
+def ignore_notifications_from_messages_tagged_with(tags, important=False):
     """Should notifications be ignored for a message tagged with the given
     tags?
     """
     ignored_tags = split_option_value('ignore_messages_tagged_with')
     for ignored_tag in ignored_tags:
+        if important and ignored_tag == 'notify_none':
+            continue
         for tag in tags:
             if tag == ignored_tag:
                 return True
@@ -593,7 +623,7 @@ def hide_message_in_buffer(buffer):
     return False
 
 
-def prepare_notification(buffer, nick, message):
+def prepare_notification(buffer, nick, message, is_highlight):
     """Prepares a notification from the given data."""
     if is_private_message(buffer):
         source = nick
@@ -619,9 +649,16 @@ def prepare_notification(buffer, nick, message):
     desktop_entry = weechat.config_get_plugin('desktop_entry')
     timeout = weechat.config_get_plugin('timeout')
     transient = should_notifications_be_transient()
-    urgency = weechat.config_get_plugin('urgency')
+    urgency = notification_urgency(buffer, is_highlight)
 
     return Notification(source, message, icon, desktop_entry, timeout, transient, urgency)
+
+
+def notification_urgency(buffer, is_highlight):
+    """Returns notification urgency, elevating mentions and PMs."""
+    if is_highlight or is_private_message(buffer):
+        return 'critical'
+    return weechat.config_get_plugin('urgency')
 
 
 def should_notifications_be_transient():
@@ -697,9 +734,20 @@ def escape_slashes(message):
     return message.replace('\\', r'\\')
 
 
+def notification_environment_available():
+    """Can desktop notifications plausibly reach the user session?"""
+    if os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'):
+        return True
+    if os.environ.get('DBUS_SESSION_BUS_ADDRESS') or os.environ.get('NOTIFY_SOCKET'):
+        return True
+    if os.environ.get('SSH_TTY'):
+        return False
+    return True
+
+
 def send_notification(notification):
     """Sends the given notification to the user."""
-    if os.environ.get('SSH_TTY') and not os.environ.get('DISPLAY'):
+    if not notification_environment_available():
         return
     notify_cmd = ['notify-send', '--app-name', 'weechat']
     if notification.icon:

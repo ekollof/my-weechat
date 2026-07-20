@@ -221,6 +221,13 @@ def hashBufferName(bufferp):
         bufferd = weechat.buffer_get_string(bufferp, "short_name")
     return bufferd
 
+def resolve_path(path):
+    """Expand WeeChat variables and ~ in config paths."""
+    if not path:
+        return ""
+    expanded = weechat.string_eval_expression(path, {}, {}, {})
+    return os.path.expanduser(expanded)
+
 def ug_config_reload_cb(data, config_file):
     """ Reload configuration file. """
     return weechat.config_reload(config_file)
@@ -385,7 +392,7 @@ class UrlGrabber:
         if urlGrabSettings['url_log']:
             try :
                 index = self.globalUrls[0]
-                logfile = os.path.expanduser(urlGrabSettings['url_log'])
+                logfile = resolve_path(urlGrabSettings['url_log'])
                 dout = open(logfile, "a")
                 dout.write("%s %s %s\n" % (index['time'],
                                            index['buffer'], index['url']))

@@ -16,10 +16,27 @@ Weechat config with:
 
 Then follow the post-install steps printed at the end.
 
-To refresh the export after making config changes on the source machine:
+Two scripts, opposite directions:
+
+| Script | Direction | When |
+|--------|-----------|------|
+| `./export.sh` | live WeeChat → this repo | After changing config in WeeChat (`/set`, `/fset`, buffer layout, etc.) |
+| `./install.sh` | this repo → live WeeChat | After editing files here |
+
+**Sync live → repo** (review `git diff`, then commit):
 
 ```sh
 ./export.sh
+```
+
+`export.sh` copies conf files and python scripts from your live WeeChat home,
+drops stale files removed from live, and scrubs secrets (Slack token, server
+accounts, `irc.conf`/`xmpp.conf`/etc.) before writing into `weechat-conf/`.
+
+**Deploy repo → live** (then reload scripts if needed, e.g. `/python reload urlgrab`):
+
+```sh
+./install.sh
 ```
 
 ---
@@ -88,7 +105,7 @@ Or use secured data:
 
 ### wee-slack
 
-Python script for Slack. Included in `weechat-python/wee_slack.py`.
+Python script for Slack. Included in `weechat-python/slack.py` (wee-slack 2.11).
 The Slack API token is **not** included — you must re-authenticate.
 
 **Get a token** (in weechat after the script loads):
@@ -234,17 +251,30 @@ stay accurate across theme changes.
 
 ## Secrets
 
-Nothing in this export contains passwords or tokens. After install, set these
-in weechat:
+This repo is **UI and scripts only**. Passwords, tokens, server addresses, and
+account details never belong here.
+
+| Stays local only | Shipped in export |
+|------------------|-------------------|
+| `sec.conf` (encrypted secrets) | `weechat.conf`, `buflist.conf`, `trigger.conf`, … |
+| `irc.conf`, `xmpp.conf`, `relay.conf` | `plugins.conf` (Slack token placeholder only) |
+| Real Slack token in `plugins.conf` | Python scripts, `xmpp.so` binary |
+
+**How it works:**
+
+- `export.sh` copies live config, scrubs tokens/account lines, and runs
+  `install.py --audit-export` — export fails if secrets slip through.
+- `install.py` merges non-secret settings into your machine. It refuses to run
+  if the repo contains secrets, never overwrites a real Slack token, and does not
+  ship `irc.conf` / `xmpp.conf`.
+
+After install, configure secrets locally in WeeChat:
 
 ```
 /secure set xmpp_yourname    <xmpp password>
 /secure set znc_libera      <znc password>
 /slack register             (follow prompts for Slack token)
 ```
-
-The `sec.conf` file is encrypted with a machine-specific passphrase and is
-intentionally excluded from this export.
 
 ---
 

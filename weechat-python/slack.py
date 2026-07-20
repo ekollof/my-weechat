@@ -76,7 +76,7 @@ except ImportError:
 
 SCRIPT_NAME = "slack"
 SCRIPT_AUTHOR = "Trygve Aaberge <trygveaa@gmail.com>"
-SCRIPT_VERSION = "2.10.2"
+SCRIPT_VERSION = "2.11.0"
 SCRIPT_LICENSE = "MIT"
 SCRIPT_DESC = "Extends WeeChat for typing notification/search/etc on slack.com"
 REPO_URL = "https://github.com/wee-slack/wee-slack"
@@ -598,12 +598,11 @@ class EventRouter(object):
     def shutdown(self):
         """
         complete
-        This toggles shutdown mode. Shutdown mode tells us not to
-        talk to Slack anymore. Without this, typing /quit will trigger
-        a race with the buffer close callback and may result in you
-        leaving every slack channel.
+        Enter shutdown mode so we stop talking to Slack. Without this,
+        typing /quit can race buffer close callbacks and leave channels.
+        Always sets shutting_down True (never toggles) so unload is safe.
         """
-        self.shutting_down = not self.shutting_down
+        self.shutting_down = True
 
     def register_team(self, team):
         """
@@ -644,7 +643,11 @@ class EventRouter(object):
         the data is valid JSON, add metadata, and place it back
         on the queue for processing as JSON.
         """
-        team = self.teams[team_hash]
+        if self.shutting_down:
+            return w.WEECHAT_RC_OK
+        team = self.teams.get(team_hash)
+        if team is None or team.ws is None:
+            return w.WEECHAT_RC_OK
         while True:
             try:
                 # Read the data from the websocket associated with this team.
@@ -655,6 +658,9 @@ class EventRouter(object):
             except (WebSocketConnectionClosedException, socket.error) as e:
                 handle_socket_error(e, team, "receive")
                 return w.WEECHAT_RC_OK
+            except Exception:
+                # Avoid Python fatal errors escaping hook_fd (SIGABRT on 3.14).
+                return w.WEECHAT_RC_OK
 
             if opcode == ABNF.OPCODE_PONG:
                 team.last_pong_time = time.time()
@@ -662,7 +668,10 @@ class EventRouter(object):
             elif opcode != ABNF.OPCODE_TEXT:
                 return w.WEECHAT_RC_OK
 
-            message_json = json.loads(data.decode("utf-8"))
+            try:
+                message_json = json.loads(data.decode("utf-8"))
+            except Exception:
+                return w.WEECHAT_RC_OK
             if self.recording:
                 self.record_event(message_json, team, "type", "websocket")
             message_json["wee_slack_metadata_team"] = team
@@ -721,6 +730,87 @@ class EventRouter(object):
         )
         self.receive(request_metadata)
 
+    def _http_buffer_append(self, request_metadata, out):
+        if not out:
+            return
+        if request_metadata.response_id not in self.reply_buffer:
+            self.reply_buffer[request_metadata.response_id] = StringIO()
+        self.reply_buffer[request_metadata.response_id].write(out)
+
+    def _http_buffer_value(self, request_metadata):
+        buf = self.reply_buffer.get(request_metadata.response_id)
+        return buf.getvalue() if buf else ""
+
+    def _http_process_complete_response(self, request_metadata, data, return_code):
+        """
+        Parse a fully-buffered HTTP response and enqueue the JSON body.
+
+        WeeChat's url: transfers often deliver the body in a partial (-1) chunk
+        and only finish with return_code 0 (or -2 on timeout) much later. Large
+        Slack payloads (e.g. users.list) are especially affected. Process any
+        buffered body that looks complete rather than discarding it.
+        """
+        response = self._http_buffer_value(request_metadata)
+        if not response or "\r\n\r\n" not in response:
+            return False
+
+        try:
+            body, error = self.http_check_ratelimited(request_metadata, response)
+        except Exception as e:
+            w.prnt(
+                "",
+                "slack: failed parsing headers for {} (code {}): {}".format(
+                    request_metadata.request, return_code, e
+                ),
+            )
+            return False
+
+        if error:
+            self.retry_request(request_metadata, data, return_code, error)
+            return True
+
+        body = body.lstrip("\r\n")
+        if not body:
+            return False
+
+        try:
+            j = json.loads(body)
+        except Exception as e:
+            # Incomplete body (still waiting for more chunks) — keep buffering.
+            if return_code == -1:
+                return False
+            w.prnt(
+                "",
+                "slack: invalid JSON for {} (code {}, body_len={}): {}".format(
+                    request_metadata.request, return_code, len(body), e
+                ),
+            )
+            self.retry_request(request_metadata, data, return_code, "invalid json")
+            return True
+
+        try:
+            j["wee_slack_process_method"] = request_metadata.request_normalized
+            if self.recording:
+                self.record_event(
+                    j,
+                    request_metadata.team,
+                    "wee_slack_process_method",
+                    "http",
+                )
+            j["wee_slack_request_metadata"] = request_metadata
+            self.reply_buffer.pop(request_metadata.response_id, None)
+            self.receive(j)
+            self.delete_context(data)
+        except Exception:
+            w.prnt(
+                "",
+                "slack: HTTP request callback failed for {}: {}".format(
+                    request_metadata.request, traceback.format_exc()
+                ),
+            )
+            dbg("HTTP REQUEST CALLBACK FAILED", True)
+        return True
+
     @utf8_decode
     def receive_httprequest_callback(self, data, command, return_code, out, err):
         """
@@ -732,55 +822,47 @@ class EventRouter(object):
         where the request originated and route properly.
         """
         request_metadata = self.retrieve_context(data)
+        if request_metadata is None:
+            # Expected after we finish early from a partial (-1) callback; the
+            # final 0/-2 from WeeChat can still arrive with no context left.
+            return w.WEECHAT_RC_OK
+
         dbg(
             "RECEIVED CALLBACK with request of {} id of {} and  code {} of length {}".format(
                 request_metadata.request,
                 request_metadata.response_id,
                 return_code,
-                len(out),
+                len(out) if out else 0,
             )
         )
-        if return_code == 0:
-            if len(out) > 0:
-                if request_metadata.response_id not in self.reply_buffer:
-                    self.reply_buffer[request_metadata.response_id] = StringIO()
-                self.reply_buffer[request_metadata.response_id].write(out)
 
-                response = self.reply_buffer[request_metadata.response_id].getvalue()
-                body, error = self.http_check_ratelimited(request_metadata, response)
-                if error:
-                    self.retry_request(request_metadata, data, return_code, error)
-                else:
-                    j = json.loads(body)
+        # Always accumulate any payload first.
+        self._http_buffer_append(request_metadata, out)
 
-                    try:
-                        j["wee_slack_process_method"] = (
-                            request_metadata.request_normalized
-                        )
-                        if self.recording:
-                            self.record_event(
-                                j,
-                                request_metadata.team,
-                                "wee_slack_process_method",
-                                "http",
-                            )
-                        j["wee_slack_request_metadata"] = request_metadata
-                        self.reply_buffer.pop(request_metadata.response_id)
-                        self.receive(j)
-                        self.delete_context(data)
-                    except:
-                        dbg("HTTP REQUEST CALLBACK FAILED", True)
-            # We got an empty reply and this is weird so just ditch it and retry
-            else:
+        if return_code == -1:
+            # Partial data. If a full JSON response is already buffered (common
+            # for large Slack lists on HTTP/2), process early so we don't wait
+            # ~20s for libcurl/WeeChat to close the transfer.
+            self._http_process_complete_response(request_metadata, data, return_code)
+            return w.WEECHAT_RC_OK
+
+        if return_code == 0 or (
+            return_code == -2 and self._http_buffer_value(request_metadata)
+        ):
+            # Success, or timeout/error with a usable buffered body.
+            if self._http_process_complete_response(
+                request_metadata, data, return_code
+            ):
+                return w.WEECHAT_RC_OK
+            # No usable body yet (or empty final chunk without prior buffer).
+            if return_code == 0:
                 dbg("length was zero, probably a bug..")
+                self.reply_buffer.pop(request_metadata.response_id, None)
                 self.delete_context(data)
                 self.receive(request_metadata)
-        elif return_code == -1:
-            if request_metadata.response_id not in self.reply_buffer:
-                self.reply_buffer[request_metadata.response_id] = StringIO()
-            self.reply_buffer[request_metadata.response_id].write(out)
-        else:
-            self.retry_request(request_metadata, data, return_code, err)
+                return w.WEECHAT_RC_OK
+
+        self.retry_request(request_metadata, data, return_code, err)
         return w.WEECHAT_RC_OK
 
     def receive(self, dataobj, slow=False):
@@ -831,6 +913,34 @@ class EventRouter(object):
                         self.slow_queue.append(j)
                 else:
                     dbg("Max retries for Slackrequest")
+                    w.prnt(
+                        "",
+                        "slack: giving up on {} after too many failed attempts".format(
+                            j.request
+                        ),
+                    )
+                    # Invoke callback with a synthetic error so bootstrap
+                    # remaining-counters can finish instead of hanging forever.
+                    if callable(j.callback):
+                        try:
+                            j.callback(
+                                {
+                                    "ok": False,
+                                    "error": "max_retries",
+                                    "wee_slack_request_metadata": j,
+                                },
+                                self,
+                                j.team,
+                                j.channel,
+                                j.metadata,
+                            )
+                        except Exception:
+                            w.prnt(
+                                "",
+                                "slack: error in max-retry callback for {}:\n{}".format(
+                                    j.request, traceback.format_exc()
+                                ),
+                            )
 
             else:
                 if "reply_to" in j:
@@ -893,11 +1003,12 @@ class EventRouter(object):
 def handle_next(data, remaining_calls):
     try:
         EVENTROUTER.handle_next()
-    except:
+    except Exception:
+        # Never swallow connection/bootstrap errors silently — that left Slack
+        # stuck on "Connecting to 1 slack team" with no buffers and no message.
+        w.prnt("", "slack: error in event router:\n{}".format(traceback.format_exc()))
         if config.debug_mode:
             traceback.print_exc()
-        else:
-            pass
     return w.WEECHAT_RC_OK
 
 
@@ -1432,7 +1543,17 @@ def complete_next_cb(data, current_buffer, command):
 
 
 def script_unloaded():
-    stop_talking_to_slack()
+    try:
+        stop_talking_to_slack()
+    except Exception:
+        # Never raise during WeeChat unload — Python 3.x can abort the
+        # process (SIGABRT) if an exception escapes the unload callback.
+        try:
+            w.prnt("", "slack: error during unload (ignored):\n{}".format(
+                traceback.format_exc()
+            ))
+        except Exception:
+            pass
     return w.WEECHAT_RC_OK
 
 
@@ -1441,12 +1562,60 @@ def stop_talking_to_slack():
     complete
     Prevents a race condition where quitting closes buffers
     which triggers leaving the channel because of how close
-    buffer is handled
+    buffer is handled.
+
+    Important for unload safety: unhook WeeChat fd hooks *before*
+    closing the websocket. Closing the socket first leaves hook_fd on a
+    dead/recycled fd and has caused SIGABRT on quit (Python unload).
     """
-    if "EVENTROUTER" in globals():
-        EVENTROUTER.shutdown()
-        for team in EVENTROUTER.teams.values():
-            team.ws.shutdown()
+    if "EVENTROUTER" not in globals():
+        return w.WEECHAT_RC_OK
+
+    EVENTROUTER.shutdown()
+
+    # Stop the event timer so no more HTTP/WS work is scheduled.
+    try:
+        if EVENTROUTER.handle_next_hook:
+            w.unhook(EVENTROUTER.handle_next_hook)
+            EVENTROUTER.handle_next_hook = None
+    except Exception:
+        pass
+
+    for team in list(EVENTROUTER.teams.values()):
+        # 1) Unhook fd watchers first
+        hook = getattr(team, "hook", None)
+        if hook:
+            try:
+                w.unhook(hook)
+            except Exception:
+                pass
+            try:
+                team.hook = None
+            except Exception:
+                pass
+
+        # 2) Then close the websocket (if any)
+        ws = getattr(team, "ws", None)
+        if ws is not None:
+            try:
+                # Prefer close(); shutdown() only drops the socket and can
+                # race with WeeChat's hook_fd bookkeeping.
+                if hasattr(ws, "close"):
+                    ws.close()
+                elif hasattr(ws, "shutdown"):
+                    ws.shutdown()
+            except Exception:
+                pass
+            try:
+                team.ws = None
+            except Exception:
+                pass
+
+        try:
+            team.connected = False
+        except Exception:
+            pass
+
     return w.WEECHAT_RC_OK
 
 
@@ -1532,6 +1701,11 @@ class SlackRequest(object):
             "useragent": "wee_slack {}".format(SCRIPT_VERSION),
             "httpheader": "Authorization: Bearer {}".format(self.token),
             "cookie": cookies,
+            # WeeChat's libcurl default (IPRESOLVE_WHATEVER) tries IPv6 first on
+            # this host; AAAA/connect blackholes for ~20s before falling back to
+            # IPv4. Forcing V4 makes Slack API calls ~0.2s instead of ~20s.
+            # WeeChat option enum: WHATEVER, V4, V6 (case-insensitive).
+            "ipresolve": "V4",
         }
 
     def options_as_cli_args(self):
@@ -1595,7 +1769,7 @@ class SlackTeam(object):
         users,
         bots,
         channels,
-        **kwargs,
+        **kwargs
     ):
         self.slack_api_translator = copy.deepcopy(SLACK_API_TRANSLATOR)
         self.identifier = team_info["id"]
@@ -2060,9 +2234,7 @@ class SlackChannelCommon(object):
             f |= re.MULTILINE if "m" in flags else 0
             f |= re.DOTALL if "s" in flags else 0
             old_message_text = message.message_json["text"]
-            new_message_text = re.sub(
-                old, new, old_message_text, count=num_replace, flags=f
-            )
+            new_message_text = re.sub(old, new, old_message_text, num_replace, f)
             if new_message_text != old_message_text:
                 post_data = {
                     "channel": self.identifier,
@@ -3671,26 +3843,6 @@ class SlackTS(object):
 ###### New handlers
 
 
-def parse_all_notifications_prefs(all_notifications_prefs_json):
-    try:
-        all_notifications_prefs = json.loads(all_notifications_prefs_json)
-    except json.decoder.JSONDecodeError:
-        all_notifications_prefs = {}
-
-    channels_prefs = all_notifications_prefs.get("channels", {})
-    muted_channels = set(
-        channel_id
-        for channel_id, channel_prefs in channels_prefs.items()
-        if channel_prefs.get("muted")
-    )
-
-    global_keywords = all_notifications_prefs.get("global", {}).get("global_keywords")
-    return {
-        "muted_channels": ",".join(muted_channels),
-        "global_keywords": global_keywords,
-    }
-
-
 def handle_rtmstart(login_data, eventrouter, team, channel, metadata):
     """
     This handles the main entry call to slack, rtm.start
@@ -3767,10 +3919,6 @@ def handle_rtmstart(login_data, eventrouter, team, channel, metadata):
             if not item["is_mpim"]:
                 channels[item["id"]] = SlackGroupChannel(eventrouter, **item)
 
-        all_notifications_prefs = parse_all_notifications_prefs(
-            login_data["self"]["prefs"].get("all_notifications_prefs", "")
-        )
-
         t = SlackTeam(
             eventrouter,
             metadata.token,
@@ -3784,8 +3932,8 @@ def handle_rtmstart(login_data, eventrouter, team, channel, metadata):
             users,
             bots,
             channels,
-            muted_channels=notifications_prefs["muted_channels"],
-            highlight_words=notifications_prefs["global_keywords"] or "",
+            muted_channels=login_data["self"]["prefs"].get("muted_channels", ""),
+            highlight_words=login_data["self"]["prefs"].get("highlight_words", ""),
         )
         eventrouter.register_team(t)
 
@@ -4143,11 +4291,15 @@ def process_pref_change(message_json, eventrouter, team, channel, metadata):
     elif message_json["name"] == "highlight_words":
         team.set_highlight_words(message_json["value"])
     elif message_json["name"] == "all_notifications_prefs":
-        notifications_prefs = parse_all_notifications_prefs(message_json["value"])
-        if notifications_prefs["muted_channels"] is not None:
-            team.set_muted_channels(notifications_prefs["muted_channels"])
-        if notifications_prefs["global_keywords"] is not None:
-            team.set_highlight_words(notifications_prefs["global_keywords"])
+        new_prefs = json.loads(message_json["value"])
+        new_muted_channels = set(
+            channel_id
+            for channel_id, prefs in new_prefs["channels"].items()
+            if prefs["muted"]
+        )
+        team.set_muted_channels(",".join(new_muted_channels))
+        global_keywords = new_prefs["global"]["global_keywords"]
+        team.set_highlight_words(global_keywords)
     else:
         dbg("Preference change not implemented: {}\n".format(message_json["name"]))
 
@@ -4412,7 +4564,8 @@ def process_channel_created(message_json, eventrouter, team, channel, metadata):
     item["is_member"] = False
     channel = SlackChannel(eventrouter, team=team, **item)
     team.channels[item["id"]] = channel
-    team.buffer_prnt("Channel created: {}".format(channel.name))
+    if config.log_channel_created:
+        team.buffer_prnt("Channel created: {}".format(channel.name))
 
 
 def process_channel_rename(message_json, eventrouter, team, channel, metadata):
@@ -4590,8 +4743,8 @@ def linkify_text(message, team, only_users=False, escape_characters=True):
             message
             # Replace IRC formatting chars with Slack formatting chars.
             .replace("\x02", "*")
-            .replace("\x1d", "_")
-            .replace("\x1f", config.map_underline_to)
+            .replace("\x1D", "_")
+            .replace("\x1F", config.map_underline_to)
             # Escape chars that have special meaning to Slack. Note that we do not
             # (and should not) perform full HTML entity-encoding here.
             # See https://api.slack.com/docs/message-formatting for details.
@@ -5292,11 +5445,14 @@ def modify_buffer_line(buffer_pointer, ts, new_text):
 
 
 def nick_from_profile(profile, username):
-    full_name = profile.get("real_name") or username
-    if config.use_full_names:
-        nick = full_name
+    if config.use_usernames:
+        nick = username
     else:
-        nick = profile.get("display_name") or full_name
+        full_name = profile.get("real_name") or username
+        if config.use_full_names:
+            nick = full_name
+        else:
+            nick = profile.get("display_name") or full_name
     return nick.replace(" ", "")
 
 
@@ -5365,7 +5521,12 @@ def tag(
 
 
 def set_own_presence_active(team):
-    slackbot = team.get_channel_map()["Slackbot"]
+    if config.use_usernames:
+        nick_slackbot = "slackbot"
+    else:
+        nick_slackbot = "Slackbot"
+
+    slackbot = team.get_channel_map()[nick_slackbot]
     channel = team.channels[slackbot]
     request = {"type": "typing", "channel": channel.identifier}
     channel.team.send_to_websocket(request, expect_reply=False)
@@ -5757,11 +5918,21 @@ def command_channels(data, current_buffer, args):
 @utf8_decode
 def command_users(data, current_buffer, args):
     """
-    /slack users
+    /slack users [regex]
     List the users in the current team.
+    If regex is given show only users that match the case-insensitive regex.
     """
     team = EVENTROUTER.weechat_controller.buffers[current_buffer].team
-    return print_users_info(team, "Users", team.users.values())
+
+    if args:
+        pat = re.compile(args, flags=re.IGNORECASE)
+        users = [v for v in team.users.values() if pat.search(v.name)]
+        header = 'Users that match "{}"'.format(args)
+    else:
+        users = team.users.values()
+        header = "Users"
+
+    return print_users_info(team, header, users)
 
 
 @slack_buffer_required
@@ -6821,15 +6992,15 @@ class PluginConfig(object):
         "colorize_private_chats": Setting(
             default="false", desc="Whether to use nick-colors in DM windows."
         ),
-        "debug_mode": Setting(
-            default="false",
-            desc="Open a dedicated buffer for debug messages and start logging"
-            " to it. How verbose the logging is depends on log_level.",
-        ),
         "debug_level": Setting(
             default="3",
             desc="Show only this level of debug info (or higher) when"
             " debug_mode is on. Lower levels -> more messages.",
+        ),
+        "debug_mode": Setting(
+            default="false",
+            desc="Open a dedicated buffer for debug messages and start logging"
+            " to it. How verbose the logging is depends on log_level.",
         ),
         "distracting_channels": Setting(default="", desc="List of channels to hide."),
         "external_user_suffix": Setting(
@@ -6853,6 +7024,10 @@ class PluginConfig(object):
         "link_previews": Setting(
             default="true", desc="Show previews of website content linked by teammates."
         ),
+        "log_channel_created": Setting(
+            default="true",
+            desc='Log "Channel created" in the Server buffer.',
+        ),
         "map_underline_to": Setting(
             default="_",
             desc="When sending underlined text to slack, use this formatting"
@@ -6868,6 +7043,10 @@ class PluginConfig(object):
             " all highlights, but not other messages. all: Show all activity,"
             " like other channels.",
         ),
+        "never_away": Setting(
+            default="false",
+            desc='Poke Slack every five minutes so that it never marks you "away".',
+        ),
         "notify_subscribed_threads": Setting(
             default="auto",
             desc="Control if you want to see a notification in the team buffer when a"
@@ -6879,10 +7058,6 @@ class PluginConfig(object):
             default="false",
             desc="Control if you want to see a notification in the team buffer when a"
             "usergroup's handle has changed, either true or false.",
-        ),
-        "never_away": Setting(
-            default="false",
-            desc='Poke Slack every five minutes so that it never marks you "away".',
         ),
         "record_events": Setting(
             default="false", desc="Log all traffic from Slack to disk as JSON."
@@ -6956,12 +7131,6 @@ class PluginConfig(object):
             default="false",
             desc="When enabled shows thread messages in the parent channel.",
         ),
-        "unfurl_ignore_alt_text": Setting(
-            default="false",
-            desc='When displaying ("unfurling") links to channels/users/etc,'
-            ' ignore the "alt text" present in the message and instead use the'
-            " canonical name of the thing being linked to.",
-        ),
         "unfurl_auto_link_display": Setting(
             default="both",
             desc='When displaying ("unfurling") links to channels/users/etc,'
@@ -6971,6 +7140,12 @@ class PluginConfig(object):
             ' addresses. Set it to "text" to only display the text written by'
             ' the user, "url" to only display the url or "both" (the default)'
             " to display both.",
+        ),
+        "unfurl_ignore_alt_text": Setting(
+            default="false",
+            desc='When displaying ("unfurling") links to channels/users/etc,'
+            ' ignore the "alt text" present in the message and instead use the'
+            " canonical name of the thing being linked to.",
         ),
         "unhide_buffers_with_activity": Setting(
             default="false",
@@ -6983,6 +7158,11 @@ class PluginConfig(object):
             desc="Use full names as the nicks for all users. When this is"
             " false (the default), display names will be used if set, with a"
             " fallback to the full name if display name is not set.",
+        ),
+        "use_usernames": Setting(
+            default="false",
+            desc="Use usernames as the nicks for all users. Takes priority"
+            " over use_full_names. Default false.",
         ),
     }
 
@@ -7201,9 +7381,8 @@ def initiate_connection(token):
                 if response_json["error"] == "user_is_restricted":
                     w.prnt(
                         "",
-                        "You are a restricted user in this team, {} not loaded".format(
-                            data_type
-                        ),
+                        "You are a restricted user in this team, "
+                        "{} not loaded".format(data_type),
                     )
                 else:
                     initial_data["errors"].append(
@@ -7371,11 +7550,18 @@ def create_team(token, initial_data):
                 "away" if initial_data["presence"]["manual_away"] else "active"
             )
 
-            all_notifications_prefs = parse_all_notifications_prefs(
-                initial_data["prefs"].get("all_notifications_prefs", "")
-            )
+            try:
+                raw_anp = initial_data["prefs"].get("all_notifications_prefs")
+                all_notifications_prefs = (
+                    json.loads(raw_anp) if raw_anp else {}
+                )
+                global_keywords = all_notifications_prefs.get("global", {}).get(
+                    "global_keywords"
+                )
+            except (TypeError, ValueError, json.decoder.JSONDecodeError):
+                global_keywords = None
 
-            if all_notifications_prefs["global_keywords"] is None:
+            if global_keywords is None:
                 print_error(
                     "global_keywords not found in users.prefs.get", warning=True
                 )
@@ -7385,6 +7571,7 @@ def create_team(token, initial_data):
                     ),
                     level=5,
                 )
+                global_keywords = ""
 
             team_info = {
                 "id": team_id,
@@ -7409,8 +7596,10 @@ def create_team(token, initial_data):
                     users,
                     bots,
                     channels,
-                    muted_channels=all_notifications_prefs["muted_channels"],
-                    highlight_words=all_notifications_prefs["global_keywords"] or "",
+                    # Slack removed muted_channels from users.prefs.get; default
+                    # empty and rely on prefs/muted_channels websocket updates.
+                    muted_channels=initial_data["prefs"].get("muted_channels", ""),
+                    highlight_words=global_keywords,
                 )
                 eventrouter.register_team(team)
                 team.connect()
